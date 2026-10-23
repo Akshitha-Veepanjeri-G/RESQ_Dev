@@ -1,0 +1,29 @@
+# RESQ Dev — Isolated Execution Sandbox Image
+# Minimal python:3.11-slim environment with pytest, hypothesis, and non-root execution.
+
+FROM python:3.11-slim
+
+# Prevent Python from writing .pyc files and enable unbuffered output
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV PIP_NO_CACHE_DIR=1
+
+# Install testing dependencies
+RUN pip install --no-cache-dir \
+    pytest>=8.0.0 \
+    hypothesis>=6.90.0
+
+# Create unprivileged user resquser (UID 10001)
+RUN groupadd -g 10001 resqgroup && \
+    useradd -u 10001 -g resqgroup -s /sbin/nologin -m resquser
+
+# Create workspace directory with non-root ownership
+RUN mkdir -p /workspace && \
+    chown -R 10001:10001 /workspace
+
+# Switch to non-root user
+USER 10001:10001
+WORKDIR /workspace
+
+# Default command
+CMD ["pytest", "--version"]
