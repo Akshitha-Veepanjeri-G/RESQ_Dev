@@ -1,7 +1,9 @@
 """Abstract interface for replaceable LLM providers."""
 
 from abc import ABC, abstractmethod
+from typing import Any
 from resq.models import CandidatePatch, FailureArtifact
+
 
 
 class LLMProvider(ABC):
@@ -19,3 +21,15 @@ class LLMProvider(ABC):
             CandidatePatch containing proposed code and explanation.
         """
         pass
+
+    def decide_action(self, state: Any) -> Any:
+        """Evaluates current verification state and selects next bounded verification action.
+
+        Args:
+            state: AgentState snapshot.
+
+        Returns:
+            AgentDecision with selected tool, arguments, and evidence-based rationale.
+        """
+        raise NotImplementedError("decide_action is not implemented by this LLM provider.")
+

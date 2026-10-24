@@ -5,10 +5,12 @@ from resq.config import Settings, get_settings
 from resq.database import (
     VerificationJobRecord,
     domain_to_run_record,
+    domain_to_step_record,
     get_session_factory,
 )
 from resq.engine.pipeline import VerificationPipeline
 from resq.execution.docker_runner import DockerExecutionRunner
+from resq.llm.exceptions import LLMProviderError
 from resq.llm.factory import get_llm_provider
 from resq.models import Verdict
 from resq.api.schemas import JobStatus
@@ -85,8 +87,19 @@ def run_verification_task(
                 run_rec.job_id = job.id
                 job.runs.append(run_rec)
 
+            # Append all agent steps
+            for domain_step in getattr(completed_job, "agent_steps", []):
+                step_rec = domain_to_step_record(domain_step)
+                step_rec.job_id = job.id
+                job.agent_steps.append(step_rec)
+
+            job.objective = getattr(completed_job, "objective", None) or job.objective
+            job.execution_mode = getattr(completed_job, "execution_mode", None) or "mock"
+            job.termination_reason = getattr(completed_job, "termination_reason", None)
+
             final_verdict = completed_job.final_verdict
             job.final_verdict = final_verdict.value if final_verdict else None
+
 
             # Decouple Status from Verdict
             if final_verdict in NORMAL_COMPLETION_VERDICTS:
@@ -96,14 +109,20 @@ def run_verification_task(
 
             session.commit()
 
-    except Exception:
+    except Exception as exc:
         # Emergency Session 3: Persist terminal failure on fatal worker crash
         try:
             with SessionLocal() as session:
                 job = session.query(VerificationJobRecord).filter_by(id=job_id).first()
                 if job:
                     job.current_status = JobStatus.FAILED.value
-                    job.final_verdict = Verdict.INFRASTRUCTURE_ERROR.value
+                    exc_name = type(exc).__name__
+                    if "llm" in exc_name.lower() or "gemini" in str(exc).lower() or isinstance(exc, (ValueError, LLMProviderError)):
+                        job.final_verdict = Verdict.LLM_ERROR.value
+                    else:
+                        job.final_verdict = Verdict.INFRASTRUCTURE_ERROR.value
+                    job.termination_reason = f"Fatal worker exception: {type(exc).__name__}: {str(exc)}"
+                    job.execution_mode = "live_gemini" if "gemini" in (cfg.llm_provider or "").lower() else "mock"
                     session.commit()
         except Exception:
             pass  # Suppress secondary DB errors

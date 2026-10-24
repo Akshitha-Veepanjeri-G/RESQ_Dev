@@ -12,60 +12,60 @@ RESQ Dev is architected with a decoupled pipeline where execution isolation, ver
 
 ```mermaid
 flowchart TD
-    subgraph UI_Layer [Frontend Layer]
-        UI[Streamlit Dashboard]
+    subgraph UI_Layer [Frontend Layer - React.js + TypeScript]
+        UI[React 19 SPA + Vite]
+        TraceView[Agent Decision Trace & Telemetry]
     end
 
-    subgraph API_Layer [API & Orchestration Layer - Milestone 3]
+    subgraph API_Layer [API & Orchestration Layer - FastAPI]
         API[FastAPI Gateway]
-        DB[(SQLite State Store)]
+        DB[(SQLite State Store: Jobs, Runs, AgentSteps)]
+        WorkerQueue[Background Dispatcher]
     end
 
-    subgraph Core_Engine [Verification Core - Milestone 1 Independent]
-        Pipe[Verification Pipeline]
-        Analyzer[Failure Analyzer]
-        Applier[AST Patch Applier]
+    subgraph Agent_Core [RESQ Verification Agent - Agentic Core]
+        Agent[RESQVerificationAgent]
+        Cycle[Bounded Loop: Observe -> Reason -> Select -> Execute -> Evaluate]
+        Tools[Controlled Tool Registry: 10 Typed Tools]
+        TruthGate[Deterministic Truth Gate: Empirical Sandbox Verdict]
     end
 
-    subgraph Isolation_Layer [Execution Boundary]
-        Worker[Docker Execution Runner]
+    subgraph Execution_Boundary [Execution Sandbox]
+        Runner[Docker Execution Runner]
         Container[(Docker Sandbox: resq-sandbox:latest)]
     end
 
-    subgraph Intelligence_Layer [Synthesis Gateway]
-        Gateway[LLM Provider Interface]
-        MockProv[MockLLMProvider]
-        RealProv[Replaceable Real Provider]
+    subgraph LLM_Gateway [Synthesis Gateway]
+        LLMInterface[LLMProvider Interface: decide_action & generate_patch]
+        MockProv[MockLLMProvider: Evidence-Driven Offline Branching]
+        GeminiProv[GeminiLLMProvider: google-genai SDK with Structured Output]
     end
 
     %% Interactions
-    UI -->|HTTP / JSON| API
+    UI -->|HTTP / JSON polling| API
     API -->|Read/Write State| DB
-    API -->|Dispatch Job| Pipe
+    API -->|Dispatch Job| WorkerQueue
+    WorkerQueue -->|Execute| Agent
     
-    Pipe -->|1. Run Tests| Worker
-    Worker -->|Execute in Temp Mount| Container
-    Container -->|Stdout, Stderr, Exit Code| Worker
-    Worker -->|ExecutionResult| Pipe
+    Agent -->|1. Reason with State| LLMInterface
+    LLMInterface -.-> MockProv
+    LLMInterface -.-> GeminiProv
+    LLMInterface -->|Validated AgentDecision| Agent
     
-    Pipe -->|2. Parse Crash| Analyzer
-    Analyzer -->|FailureArtifact| Pipe
+    Agent -->|2. Dispatch Permitted Action| Tools
+    Tools -->|Run Baseline / Verify| Runner
+    Runner -->|Execute in Temp Mount| Container
+    Container -->|Stdout, Stderr, Exit Code| Runner
+    Runner -->|ExecutionResult| Tools
     
-    Pipe -->|3. Request Patch (Bounded Cycle)| Gateway
-    Gateway -.-> MockProv
-    Gateway -.-> RealProv
-    Gateway -->|CandidatePatch| Pipe
-    
-    Pipe -->|4. Validate AST & Apply to Temp Copy| Applier
-    Applier -->|Unified Diff & Patched Temp Dir| Pipe
-    
-    Pipe -->|5. Re-run Tests on Patched Copy| Worker
-    Worker -->|Verify Exit Code 0| Pipe
-    Pipe -->|6. Record Final Verdict| DB
+    Tools -->|3. Evaluate Observation| Agent
+    Agent -->|4. Independent Verification| TruthGate
+    TruthGate -->|Verified / Failed / Inconclusive| Agent
+    Agent -->|5. Record Trace & Step| DB
 
     %% Human Review Boundary
-    DB -.->|Poll Results & Diff| UI
-    UI ==>|7. Explicit Human Review & Manual Export| Human[Developer Decision: Accept or Discard]
+    DB -.->|Poll Trace & Diff| UI
+    UI ==>|6. Explicit Developer Review & Manual Export| Human[Developer Decision: Accept or Discard]
 ```
 
 ---
@@ -124,12 +124,27 @@ The core verification engine operates as a standalone Python library:
    - **Step 3 (Patch Application):** Applies the candidate code to `patch_temp_dir/target.py`.
    - **Step 4 (Diff Synthesis):** Uses Python's standard `difflib.unified_diff()` to generate a clean, colored unified diff between original and patched files.
    - **Step 5 (Original Source Immutability):** The original source file on the host is read-only. Even if the patch is rejected, the original file is mathematically untouched (verified via SHA-256 hash assertions in testing).
-3. **`VerificationPipeline` (Bounded Repair & Supervision Orchestrator):**
-   - Coordinates the single execution workflow: Baseline Test -> Parse Crash -> Request Patch -> Validate AST -> Apply to Temp Copy -> Re-verify in Docker.
-   - **Bounded Repair Budget:** Controlled by `max_repair_cycles: int = 1` (configurable via settings, hard capped at 2).
-   - **Zero Autonomous Looping:** If re-verification yields `REJECTED_STILL_FAILS` or `REJECTED_REGRESSION`, and the single retry budget is enabled, it attempts at most one refinement with the updated failure context. Once the budget reaches 0, the pipeline halts immediately.
-   - **Audit Visibility:** Every cycle is logged as a separate `VerificationRun` in SQLite, showing exact inputs, outputs, diffs, and verdicts.
-   - **No Autonomous Git Operations:** The pipeline has zero Git integration code. It produces diff artifacts for the developer, never committing, merging, or pushing.
+3. **`RESQVerificationAgent` (Autonomous Verification Loop):**
+   - Implements a bounded evidence-driven control loop:
+     `OBSERVE -> REASON -> SELECT ACTION -> EXECUTE TOOL -> EVALUATE RESULT -> UPDATE STATE -> CONTINUE OR STOP`
+   - Governed by hard budget limits: `agent_max_cycles` (default 8) and `agent_max_tool_calls` (default 12).
+   - Dynamically selects actions from a strictly registered, schema-validated tool interface based on accumulated failure evidence and intermediate execution results.
+   - Evaluates verdicts strictly via an independent `DeterministicTruthGate` rather than model assertions.
+4. **`ToolRegistry` (Narrow Typed Interface):**
+   - Exposes 10 permitted verification tools:
+     1. `inspect_source`: Reads target Python source code within safe line bounds.
+     2. `inspect_tests`: Inspects invariants and test files.
+     3. `run_baseline_tests`: Executes initial tests in Docker sandbox with timeout enforcement.
+     4. `analyze_failure`: Parses stack traces, failure categories, and minimized counterexamples.
+     5. `inspect_ast`: Extracts AST node summaries, functions, and import trees.
+     6. `run_hypothesis_analysis`: Ingests property-based testing feedback.
+     7. `generate_candidate_patch`: Prompts the LLM provider for a candidate fix.
+     8. `validate_candidate_patch`: Enforces AST parse syntax checks before touching disk.
+     9. `run_verification_tests`: Executes tests against the temporary patched copy in Docker.
+     10. `summarize_evidence`: Synthesizes final verification evidence bundle.
+   - Enforces strict argument validation, output size ceilings (64 KiB), and rejects unregistered or unsafe commands.
+5. **`VerificationPipeline` (Compatibility Adapter):**
+   - Seamlessly delegates execution to `RESQVerificationAgent` while preserving the exact Milestone 0-5 API signature (`run(...)`) and populating `job.runs` alongside granular `agent_steps`.
 
 ---
 
@@ -141,25 +156,34 @@ The core verification engine operates as a standalone Python library:
       def generate_patch(self, source_code: str, failure: FailureArtifact) -> CandidatePatch:
           """Synthesizes a proposed patch given the code and failure evidence."""
           pass
+
+      @abstractmethod
+      def decide_action(self, state: AgentState) -> AgentDecision:
+          """Evaluates agent state and selects next tool action."""
+          pass
   ```
 * **Implementations:**
-  - `MockLLMProvider`: Deterministic offline provider for Milestone 1 vertical slice and integration tests. Returns hardcoded valid/invalid patches matching benchmark fixtures.
-  - `RealLLMProvider`: Added in Milestone 2. Replaceable adapter calling an external AI API (e.g., Gemini, OpenAI, Anthropic). Enforces structured JSON output schema and handles API timeouts/rate-limits as `LLM_ERROR`.
+  - `MockLLMProvider`: Offline, deterministic provider. Implements evidence-driven dynamic branching (adapts choices based on observed test failures, syntax errors, and missing evidence) and supports deterministic `decision_sequence` injection for testing.
+  - `GeminiLLMProvider`: Live AI provider using the official `google-genai` SDK (`gemini-2.5-flash`). Enforces structured output via Pydantic schema (`StructuredDecisionResponse`), with robust error handling and fallback.
 
 ---
 
-### 2.4 State Store & Database Schema (`src/resq/database.py` - Milestone 3)
+### 2.4 State Store & Database Schema (`src/resq/database.py`)
 Implemented via SQLite using synchronous SQLAlchemy:
 
 ```mermaid
 erDiagram
     VERIFICATION_JOB ||--o{ VERIFICATION_RUN : contains
+    VERIFICATION_JOB ||--o{ AGENT_STEP : traces
     VERIFICATION_JOB {
         string id PK "UUID"
         string target_filename
         text source_code
         text invariants_code
         string current_status
+        string objective
+        string execution_mode "live_gemini | mock_deterministic"
+        string termination_reason
         datetime created_at
         datetime updated_at
     }
@@ -177,17 +201,46 @@ erDiagram
         float duration_seconds
         datetime executed_at
     }
+    AGENT_STEP {
+        string id PK "UUID"
+        string job_id FK
+        int cycle_number
+        string selected_action
+        string action_arguments "JSON"
+        text decision_reason
+        text expected_observation
+        string completion_status
+        string tool_status
+        text observation_summary
+        string observation_data "JSON"
+        float duration_seconds
+        datetime created_at
+    }
 ```
 
 ---
 
-### 2.5 REST API Specifications (`src/resq/api/` - Milestone 3)
+### 2.5 REST API Specifications (`src/resq/api/`)
 
 | Endpoint | Method | Request Payload | Response | Description |
 | :--- | :--- | :--- | :--- | :--- |
 | `/api/v1/health` | `GET` | None | `{"status": "ok", "docker_available": bool}` | Health and infrastructure check |
-| `/api/v1/jobs` | `POST` | `JobCreateRequest` (`source_code`, `invariants_code`) | `202 Accepted` + `JobSummaryResponse` (`job_id`, `status: PENDING`) | Submits target module and dispatches background verification |
-| `/api/v1/jobs/{job_id}` | `GET` | None | `JobDetailResponse` (status, runs, artifacts, diff, final verdict) | Polls verification status and retrieves reproducible evidence |
+| `/api/v1/jobs` | `POST` | `JobCreateRequest` (`source_code`, `invariants_code`) | `202 Accepted` + `JobSummaryResponse` (`job_id`, `status: PENDING`) | Submits target module and dispatches background agent verification |
+| `/api/v1/jobs/{job_id}` | `GET` | None | `JobDetailResponse` (status, objective, execution_mode, termination_reason, runs, agent_steps, final verdict) | Polls verification status, audit trace, and candidate diff |
+| `/api/v1/jobs/{job_id}/trace` | `GET` | None | `{"job_id": str, "objective": str, "steps": List[AgentStepResponse]}` | Dedicated endpoint retrieving granular agent decision cycles |
+
+---
+
+### 2.6 Frontend Architecture (`frontend/` - React 19 + TypeScript)
+- **Framework:** React 19 Single Page Application built with Vite.
+- **Components:**
+  - `Header`: Displays system status, Docker health, and `Agent: Active` indicator.
+  - `VerificationView`: Multi-tab inspection panel featuring:
+    - **🤖 Agent Decision Trace:** Interactive card feed rendering every decision cycle, selected tool, reasoning, expected observation, tool observation, and evidence badges.
+    - **Execution Mode Banner:** Visually distinguishes `🤖 Live Gemini Agentic Loop` from `🛡️ Mock Deterministic Agent Loop`.
+    - **Candidate Patch Diff:** Syntax-highlighted unified diff for human developer review.
+    - **Verification Runs & Evidence:** Detailed baseline and re-verification execution artifacts.
+  - **Human-in-the-Loop Export:** One-click manual diff export; strictly preserves repository immutability.
 
 ---
 

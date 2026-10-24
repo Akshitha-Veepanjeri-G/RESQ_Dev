@@ -21,6 +21,9 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 from resq.config import get_settings
 from resq.models import (
+    AgentDecision,
+    AgentObservation,
+    AgentStep,
     CandidatePatch,
     ExecutionResult,
     FailureArtifact,
@@ -124,6 +127,9 @@ class VerificationJobRecord(Base):
     invariants_code = Column(Text, nullable=False)
     current_status = Column(String(50), nullable=False, default="PENDING")
     final_verdict = Column(String(50), nullable=True)
+    objective = Column(Text, nullable=True)
+    execution_mode = Column(String(50), nullable=False, default="mock")
+    termination_reason = Column(Text, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at = Column(
         DateTime,
@@ -138,6 +144,42 @@ class VerificationJobRecord(Base):
         cascade="all, delete-orphan",
         order_by="VerificationRunRecord.cycle_index",
     )
+
+    agent_steps = relationship(
+        "AgentStepRecord",
+        back_populates="job",
+        cascade="all, delete-orphan",
+        order_by="AgentStepRecord.cycle_index",
+    )
+
+
+class AgentStepRecord(Base):
+    """Database record for a single agent decision-observation cycle."""
+
+    __tablename__ = "agent_steps"
+
+    id = Column(String(36), primary_key=True)
+    job_id = Column(
+        String(36),
+        ForeignKey("verification_jobs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    cycle_index = Column(Integer, nullable=False, default=0)
+    action = Column(String(100), nullable=False)
+    arguments = Column(Text, nullable=True)
+    reason = Column(Text, nullable=True)
+    expected_observation = Column(Text, nullable=True)
+    completion_status = Column(String(50), nullable=True, default="continue")
+    success = Column(Boolean, default=True)
+    output = Column(Text, nullable=True)
+    summary = Column(Text, nullable=True)
+    evidence_payload = Column(Text, nullable=True)
+    duration_seconds = Column(Float, default=0.0)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+    job = relationship("VerificationJobRecord", back_populates="agent_steps")
+
 
 
 class VerificationRunRecord(Base):
@@ -212,9 +254,27 @@ def get_session_factory(engine: Optional[Engine] = None):
 
 
 def init_db(engine: Optional[Engine] = None) -> None:
-    """Creates all database tables."""
+    """Creates all database tables and ensures schema is up to date."""
     eng = engine or get_engine()
     Base.metadata.create_all(bind=eng)
+
+    # Lightweight automatic schema migration for SQLite
+    with eng.connect() as conn:
+        try:
+            # Check verification_jobs table columns
+            res = conn.exec_driver_sql("PRAGMA table_info(verification_jobs)")
+            existing_cols = {row[1] for row in res.fetchall()}
+            if existing_cols:
+                if "objective" not in existing_cols:
+                    conn.exec_driver_sql("ALTER TABLE verification_jobs ADD COLUMN objective TEXT")
+                if "execution_mode" not in existing_cols:
+                    conn.exec_driver_sql("ALTER TABLE verification_jobs ADD COLUMN execution_mode VARCHAR(50) DEFAULT 'mock' NOT NULL")
+                if "termination_reason" not in existing_cols:
+                    conn.exec_driver_sql("ALTER TABLE verification_jobs ADD COLUMN termination_reason TEXT")
+            conn.commit()
+        except Exception:
+            pass  # Non-SQLite or unmigratable engine
+
 
 
 def startup_recovery(session) -> int:
@@ -335,6 +395,70 @@ def run_record_to_domain(rec: VerificationRunRecord) -> VerificationRun:
     )
 
 
+def domain_to_step_record(step: AgentStep) -> AgentStepRecord:
+    """Converts an AgentStep domain model into a bounded AgentStepRecord."""
+    args_json = json.dumps(step.decision.arguments) if step.decision.arguments else None
+    evidence_json = json.dumps(step.observation.evidence_payload) if step.observation.evidence_payload else None
+
+    return AgentStepRecord(
+        id=step.id,
+        cycle_index=step.cycle_index,
+        action=step.decision.action,
+        arguments=args_json,
+        reason=truncate_text(step.decision.reason, 4096, "reason"),
+        expected_observation=truncate_text(step.decision.expected_observation, 4096, "expected_observation"),
+        completion_status=str(step.decision.completion_status),
+        success=step.observation.success,
+        output=truncate_text(str(step.observation.output) if step.observation.output is not None else None, MAX_STDOUT_CHARS, "output"),
+        summary=truncate_text(step.observation.summary, 4096, "summary"),
+        evidence_payload=evidence_json,
+        duration_seconds=step.duration_seconds,
+        created_at=ensure_utc(step.timestamp) or datetime.now(timezone.utc),
+    )
+
+
+def step_record_to_domain(rec: AgentStepRecord) -> AgentStep:
+    """Converts an AgentStepRecord into an AgentStep domain model."""
+    arguments = {}
+    if rec.arguments:
+        try:
+            arguments = json.loads(rec.arguments)
+        except Exception:
+            arguments = {}
+
+    evidence_payload = {}
+    if rec.evidence_payload:
+        try:
+            evidence_payload = json.loads(rec.evidence_payload)
+        except Exception:
+            evidence_payload = {}
+
+    decision = AgentDecision(
+        action=rec.action,
+        arguments=arguments,
+        reason=rec.reason or "",
+        expected_observation=rec.expected_observation or "",
+        completion_status=rec.completion_status or "continue",
+    )
+
+    observation = AgentObservation(
+        tool_name=rec.action,
+        success=bool(rec.success),
+        output=rec.output,
+        summary=rec.summary or "",
+        evidence_payload=evidence_payload,
+    )
+
+    return AgentStep(
+        id=rec.id,
+        cycle_index=rec.cycle_index,
+        decision=decision,
+        observation=observation,
+        duration_seconds=rec.duration_seconds or 0.0,
+        timestamp=ensure_utc(rec.created_at) or datetime.now(timezone.utc),
+    )
+
+
 def domain_to_job_record(job: VerificationJob, test_filename: str = "test_target.py") -> VerificationJobRecord:
     """Converts a VerificationJob domain model into a VerificationJobRecord."""
     rec = VerificationJobRecord(
@@ -345,6 +469,9 @@ def domain_to_job_record(job: VerificationJob, test_filename: str = "test_target
         invariants_code=job.invariants_code,
         current_status=job.current_status,
         final_verdict=job.final_verdict.value if isinstance(job.final_verdict, Verdict) else job.final_verdict,
+        objective=job.objective,
+        execution_mode=job.execution_mode,
+        termination_reason=job.termination_reason,
         created_at=ensure_utc(job.created_at) or datetime.now(timezone.utc),
         updated_at=ensure_utc(job.updated_at) or datetime.now(timezone.utc),
     )
@@ -352,12 +479,20 @@ def domain_to_job_record(job: VerificationJob, test_filename: str = "test_target
         run_rec = domain_to_run_record(run)
         run_rec.job_id = job.id
         rec.runs.append(run_rec)
+
+    for step in job.agent_steps:
+        step_rec = domain_to_step_record(step)
+        step_rec.job_id = job.id
+        rec.agent_steps.append(step_rec)
+
     return rec
 
 
 def job_record_to_domain(rec: VerificationJobRecord) -> VerificationJob:
     """Converts a VerificationJobRecord into a VerificationJob domain model."""
     domain_runs = [run_record_to_domain(r) for r in rec.runs]
+    domain_steps = [step_record_to_domain(s) for s in getattr(rec, "agent_steps", [])]
+
     return VerificationJob(
         id=rec.id,
         target_filename=rec.target_filename,
@@ -365,7 +500,12 @@ def job_record_to_domain(rec: VerificationJobRecord) -> VerificationJob:
         invariants_code=rec.invariants_code,
         current_status=rec.current_status,
         final_verdict=Verdict(rec.final_verdict) if rec.final_verdict else None,
+        objective=rec.objective or "Investigate failure, evaluate defect hypothesis, and verify candidate patch against edge-case invariants",
+        execution_mode=rec.execution_mode or "mock",
+        termination_reason=rec.termination_reason,
         runs=domain_runs,
+        agent_steps=domain_steps,
         created_at=ensure_utc(rec.created_at) or datetime.now(timezone.utc),
         updated_at=ensure_utc(rec.updated_at) or datetime.now(timezone.utc),
     )
+

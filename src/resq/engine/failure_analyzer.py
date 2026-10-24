@@ -78,6 +78,11 @@ class FailureAnalyzer:
         if exc_match:
             exception_type = exc_match.group(1).strip()
             assertion_message = (exc_match.group(2) or "").strip()
+        else:
+            assert_match = re.search(r"^E\s+(assert\s+.*)$", combined_output, re.MULTILINE)
+            if assert_match:
+                exception_type = "AssertionError"
+                assertion_message = assert_match.group(1).strip()
 
         # 4. Extract traceback snippet
         traceback_raw = combined_output

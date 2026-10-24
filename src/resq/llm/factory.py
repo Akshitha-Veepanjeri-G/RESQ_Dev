@@ -28,6 +28,12 @@ def get_llm_provider(settings: Optional[Settings] = None) -> LLMProvider:
         return MockLLMProvider()
 
     if provider_name == "gemini":
+        if not active_settings.gemini_api_key:
+            raise ValueError(
+                "Gemini LLM provider requested (RESQ_LLM_PROVIDER=gemini), but no API key was configured. "
+                "Set GEMINI_API_KEY or RESQ_GEMINI_API_KEY in the environment or .env file. "
+                "Silent fallback to mock provider is strictly forbidden."
+            )
         from resq.llm.gemini_provider import GeminiLLMProvider
         return GeminiLLMProvider(settings=active_settings)
 

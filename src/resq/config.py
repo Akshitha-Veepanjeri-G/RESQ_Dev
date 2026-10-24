@@ -1,9 +1,11 @@
-"""Configuration management for RESQ Dev using Pydantic Settings."""
-
 from functools import lru_cache
+from pathlib import Path
 from typing import Optional
-from pydantic import Field, field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+DOTENV_PATH = PROJECT_ROOT / ".env"
 
 
 class Settings(BaseSettings):
@@ -12,10 +14,12 @@ class Settings(BaseSettings):
     # Docker Execution Sandbox
     docker_image_name: str = Field(
         default="resq-sandbox:latest",
+        validation_alias=AliasChoices("resq_docker_image_name", "docker_image_name"),
         description="Docker image tag used for isolated code execution.",
     )
     max_execution_timeout_seconds: int = Field(
         default=10,
+        validation_alias=AliasChoices("resq_max_execution_timeout_seconds", "max_execution_timeout_seconds"),
         description="Hard execution timeout in seconds enforced by host runner.",
     )
     docker_memory_limit: str = Field(
@@ -42,18 +46,35 @@ class Settings(BaseSettings):
         default=1,
         description="Maximum repair/retry attempts before halting. Hard maximum of 2.",
     )
+    agent_max_cycles: int = Field(
+        default=8,
+        ge=1,
+        le=20,
+        validation_alias=AliasChoices("resq_agent_max_cycles", "agent_max_cycles"),
+        description="Maximum decision cycles for the autonomous verification agent.",
+    )
+    agent_max_tool_calls: int = Field(
+        default=12,
+        ge=1,
+        le=30,
+        validation_alias=AliasChoices("resq_agent_max_tool_calls", "agent_max_tool_calls"),
+        description="Maximum tool invocations permitted per verification job.",
+    )
 
     # Replaceable LLM Gateway Configuration
     llm_provider: str = Field(
         default="mock",
+        validation_alias=AliasChoices("resq_llm_provider", "llm_provider"),
         description="Active LLM provider adapter: 'mock', 'gemini', 'openai', or 'anthropic'.",
     )
     gemini_api_key: Optional[str] = Field(
         default=None,
+        validation_alias=AliasChoices("resq_gemini_api_key", "gemini_api_key", "google_api_key"),
         description="API key for Google Gemini provider (optional).",
     )
     gemini_model: str = Field(
         default="gemini-2.5-flash",
+        validation_alias=AliasChoices("resq_gemini_model", "gemini_model"),
         description="Gemini model tag for code repair synthesis.",
     )
     llm_request_timeout_seconds: float = Field(
@@ -96,7 +117,7 @@ class Settings(BaseSettings):
     )
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=(str(DOTENV_PATH), ".env"),
         env_file_encoding="utf-8",
         extra="ignore",
     )

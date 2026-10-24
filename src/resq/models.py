@@ -109,6 +109,37 @@ class VerificationRun(BaseModel):
     executed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
+class AgentDecision(BaseModel):
+    """Structured decision produced by the agent controller / LLM provider."""
+
+    action: str = Field(description="Name of the registered tool or control decision ('stop').")
+    arguments: dict[str, Any] = Field(default_factory=dict, description="Schema-validated arguments for tool.")
+    reason: str = Field(description="Concise, evidence-based explanation for choosing this action.")
+    expected_observation: str = Field(description="What information or outcome the agent expects.")
+    completion_status: str = Field(default="continue", description="continue, completed, needs_human_review, blocked, or inconclusive.")
+
+
+class AgentObservation(BaseModel):
+    """Structured observation and evidence captured after tool execution."""
+
+    tool_name: str = Field(description="Tool that was executed.")
+    success: bool = Field(default=True, description="Whether the tool executed without error.")
+    output: Any = Field(default=None, description="Raw or bounded output from tool.")
+    summary: str = Field(default="", description="Human-readable summary of the observation.")
+    evidence_payload: dict[str, Any] = Field(default_factory=dict, description="Structured key-value evidence.")
+
+
+class AgentStep(BaseModel):
+    """Record of a single decision cycle in the agent loop."""
+
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    cycle_index: int = Field(ge=0, description="Cycle index.")
+    decision: AgentDecision = Field(description="Decision made by the agent.")
+    observation: AgentObservation = Field(description="Result observed after tool execution.")
+    duration_seconds: float = Field(default=0.0, ge=0.0, description="Time spent in this cycle.")
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
 class VerificationJob(BaseModel):
     """Lifecycle entity for a verification task on a target module."""
 
@@ -118,6 +149,14 @@ class VerificationJob(BaseModel):
     invariants_code: str = Field(default="", description="Property-based tests or invariant specifications.")
     current_status: str = Field(default="PENDING", description="Current lifecycle state of the job.")
     final_verdict: Optional[Verdict] = Field(default=None, description="Final deterministic verdict.")
+    objective: str = Field(
+        default="Investigate failure, evaluate defect hypothesis, and verify candidate patch against edge-case invariants",
+        description="Verification goal.",
+    )
+    execution_mode: str = Field(default="mock", description="Execution mode: 'mock' or 'live_gemini'.")
+    termination_reason: Optional[str] = Field(default=None, description="Detailed explanation of why the agent terminated.")
     runs: list[VerificationRun] = Field(default_factory=list, description="Ordered history of execution runs.")
+    agent_steps: list[AgentStep] = Field(default_factory=list, description="Ordered history of agent decision cycles.")
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+

@@ -1,5 +1,4 @@
-"""API routes for RESQ Dev verification service."""
-
+import json
 import subprocess
 import uuid
 from typing import List, Optional
@@ -14,6 +13,9 @@ from resq.database import (
 )
 from resq.models import Verdict
 from resq.api.schemas import (
+    AgentDecisionResponse,
+    AgentObservationResponse,
+    AgentStepResponse,
     CandidatePatchResponse,
     ExecutionResultResponse,
     FailureArtifactResponse,
@@ -25,6 +27,7 @@ from resq.api.schemas import (
     VerificationRunResponse,
 )
 from resq.api.worker import run_verification_task
+
 
 router = APIRouter(prefix="/api/v1")
 
@@ -84,11 +87,17 @@ def health_check(request: Request):
             },
         )
 
+    settings = getattr(request.app.state, "settings", None) or get_settings()
+    provider = (settings.llm_provider or "mock").lower()
+    has_cred = bool(settings.gemini_api_key) if provider == "gemini" else True
+
     health_status = "ok" if docker_ok else "degraded"
     return HealthResponse(
         status=health_status,
         database_connected=True,
         docker_available=docker_ok,
+        llm_provider=provider,
+        credential_configured=has_cred,
         version="0.1.0",
     )
 
@@ -101,6 +110,17 @@ def submit_job(
     db=Depends(get_db),
 ):
     """Submits target Python source and test code for background verification."""
+    settings = getattr(request.app.state, "settings", None) or get_settings()
+    if (settings.llm_provider or "").lower().strip() == "gemini" and not settings.gemini_api_key:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Gemini LLM provider is configured (RESQ_LLM_PROVIDER=gemini), but no API key was provided. "
+                "Configure GEMINI_API_KEY in your local .env file before submitting verification jobs. "
+                "Silent fallback to mock mode is disabled."
+            ),
+        )
+
     job_id = str(uuid.uuid4())
     job_record = VerificationJobRecord(
         id=job_id,
@@ -196,16 +216,111 @@ def get_job_detail(job_id: str, db=Depends(get_db)):
             )
         )
 
+    agent_step_responses: List[AgentStepResponse] = []
+    for s in getattr(job, "agent_steps", []):
+        args = {}
+        if s.arguments:
+            try:
+                args = json.loads(s.arguments)
+            except Exception:
+                args = {}
+
+        evidence = {}
+        if s.evidence_payload:
+            try:
+                evidence = json.loads(s.evidence_payload)
+            except Exception:
+                evidence = {}
+
+        agent_step_responses.append(
+            AgentStepResponse(
+                id=s.id,
+                cycle_index=s.cycle_index,
+                decision=AgentDecisionResponse(
+                    action=s.action,
+                    arguments=args,
+                    reason=s.reason or "",
+                    expected_observation=s.expected_observation or "",
+                    completion_status=s.completion_status or "continue",
+                ),
+                observation=AgentObservationResponse(
+                    tool_name=s.action,
+                    success=bool(s.success),
+                    output=s.output,
+                    summary=s.summary or "",
+                    evidence_payload=evidence,
+                ),
+                duration_seconds=s.duration_seconds or 0.0,
+                timestamp=ensure_utc(s.created_at),
+            )
+        )
+
     return JobDetailResponse(
         id=job.id,
         target_filename=job.target_filename,
         test_filename=job.test_filename,
         current_status=JobStatus(job.current_status),
         final_verdict=Verdict(job.final_verdict) if job.final_verdict else None,
+        objective=getattr(job, "objective", None) or "Investigate failure, evaluate defect hypothesis, and verify candidate patch against edge-case invariants",
+        execution_mode=getattr(job, "execution_mode", None) or "mock",
+        termination_reason=getattr(job, "termination_reason", None),
         runs=run_responses,
+        agent_steps=agent_step_responses,
         created_at=ensure_utc(job.created_at),
         updated_at=ensure_utc(job.updated_at),
     )
+
+
+@router.get("/jobs/{job_id}/trace", response_model=List[AgentStepResponse])
+def get_job_agent_trace(job_id: str, db=Depends(get_db)):
+    """Retrieves full sequential agent decision trace and tool observations for a job."""
+    job = db.query(VerificationJobRecord).filter_by(id=job_id).first()
+    if not job:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Verification job '{job_id}' not found",
+        )
+
+    trace: List[AgentStepResponse] = []
+    for s in getattr(job, "agent_steps", []):
+        args = {}
+        if s.arguments:
+            try:
+                args = json.loads(s.arguments)
+            except Exception:
+                args = {}
+
+        evidence = {}
+        if s.evidence_payload:
+            try:
+                evidence = json.loads(s.evidence_payload)
+            except Exception:
+                evidence = {}
+
+        trace.append(
+            AgentStepResponse(
+                id=s.id,
+                cycle_index=s.cycle_index,
+                decision=AgentDecisionResponse(
+                    action=s.action,
+                    arguments=args,
+                    reason=s.reason or "",
+                    expected_observation=s.expected_observation or "",
+                    completion_status=s.completion_status or "continue",
+                ),
+                observation=AgentObservationResponse(
+                    tool_name=s.action,
+                    success=bool(s.success),
+                    output=s.output,
+                    summary=s.summary or "",
+                    evidence_payload=evidence,
+                ),
+                duration_seconds=s.duration_seconds or 0.0,
+                timestamp=ensure_utc(s.created_at),
+            )
+        )
+    return trace
+
 
 
 @router.get("/jobs", response_model=List[JobSummaryResponse])

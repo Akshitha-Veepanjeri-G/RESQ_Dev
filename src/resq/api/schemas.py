@@ -126,6 +126,37 @@ class VerificationRunResponse(BaseModel):
     executed_at: datetime
 
 
+class AgentDecisionResponse(BaseModel):
+    """Decision produced during an agent cycle."""
+
+    action: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    reason: str
+    expected_observation: str
+    completion_status: str = "continue"
+
+
+class AgentObservationResponse(BaseModel):
+    """Observation and evidence captured after tool execution."""
+
+    tool_name: str
+    success: bool
+    output: Optional[Any] = None
+    summary: str
+    evidence_payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentStepResponse(BaseModel):
+    """Record of a single agent decision cycle."""
+
+    id: str
+    cycle_index: int
+    decision: AgentDecisionResponse
+    observation: AgentObservationResponse
+    duration_seconds: float = 0.0
+    timestamp: datetime
+
+
 class JobDetailResponse(BaseModel):
     """Detailed record of a verification job, omitting raw submitted code by default."""
 
@@ -134,9 +165,14 @@ class JobDetailResponse(BaseModel):
     test_filename: str
     current_status: JobStatus
     final_verdict: Optional[Verdict] = None
+    objective: str = "Investigate failure, evaluate defect hypothesis, and verify candidate patch against edge-case invariants"
+    execution_mode: str = "mock"
+    termination_reason: Optional[str] = None
     runs: list[VerificationRunResponse] = Field(default_factory=list)
+    agent_steps: list[AgentStepResponse] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
+
 
 
 class JobListResponse(BaseModel):
@@ -152,4 +188,6 @@ class HealthResponse(BaseModel):
     status: str  # "ok" | "degraded" | "unhealthy"
     database_connected: bool
     docker_available: bool
+    llm_provider: str = "mock"
+    credential_configured: bool = False
     version: str = "0.1.0"

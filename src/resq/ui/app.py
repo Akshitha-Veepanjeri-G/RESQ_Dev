@@ -20,9 +20,11 @@ from resq.ui.components import (
     BENCHMARK_FIXTURES,
     format_status_badge,
     format_verdict_badge,
+    inject_custom_css,
     render_execution_runs,
     render_header,
     render_health_status,
+    render_pipeline_stepper,
     should_continue_polling,
 )
 
@@ -32,7 +34,11 @@ def main():
         page_title="RESQ Dev — Verification Assistant",
         page_icon="🛡️",
         layout="wide",
+        initial_sidebar_state="expanded",
     )
+
+    # Inject high-polish modern stylesheet
+    inject_custom_css()
 
     # 1. Initialize session state
     st.session_state.setdefault("api_base_url", "http://127.0.0.1:8000")
@@ -43,6 +49,7 @@ def main():
     st.session_state.setdefault("invariants_code", "")
     st.session_state.setdefault("target_filename", "target.py")
     st.session_state.setdefault("test_filename", "test_target.py")
+    st.session_state.setdefault("history_filter", "All")
 
     client = RESQApiClient(base_url=st.session_state.api_base_url)
 
@@ -51,7 +58,7 @@ def main():
 
         # 2. Sidebar controls: Health, Settings, Template Loader, Job History
         with st.sidebar:
-            st.header("⚙️ Backend Configuration")
+            st.markdown("### ⚙️ System Diagnostics")
             api_url_input = st.text_input(
                 "API Base URL",
                 value=st.session_state.api_base_url,
@@ -67,45 +74,75 @@ def main():
             render_health_status(health)
 
             st.divider()
-            st.header("📁 Benchmark Templates")
+            st.markdown("### 📁 1-Click Benchmark Presets")
+            st.caption("Load real-world algorithmic defects with property-based Hypothesis invariants.")
             fixture_choice = st.selectbox(
-                "Select Pre-packaged Benchmark",
+                "Select Benchmark Preset",
                 options=list(BENCHMARK_FIXTURES.keys()),
             )
-            if st.button("Load Template into Form"):
-                selected_data = BENCHMARK_FIXTURES[fixture_choice]
-                st.session_state.source_code = selected_data["source_code"]
-                st.session_state.invariants_code = selected_data["invariants_code"]
-                st.session_state.target_filename = selected_data["target_filename"]
-                st.session_state.test_filename = selected_data["test_filename"]
-                st.success(f"Loaded '{fixture_choice}' template.")
+            selected_fixture = BENCHMARK_FIXTURES[fixture_choice]
+            
+            # Display fixture metadata preview
+            if "defect" in selected_fixture:
+                st.caption(f"**Defect:** {selected_fixture['defect']}")
+                st.caption(f"**Target Verdict:** `{selected_fixture.get('expected_verdict', 'N/A')}`")
+
+            if st.button("📥 Load Preset into Form", use_container_width=True, type="secondary"):
+                st.session_state.source_code = selected_fixture["source_code"]
+                st.session_state.invariants_code = selected_fixture["invariants_code"]
+                st.session_state.target_filename = selected_fixture["target_filename"]
+                st.session_state.test_filename = selected_fixture["test_filename"]
+                st.success(f"Loaded: {fixture_choice}")
+                st.rerun()
 
             st.divider()
-            st.header("📜 Recent Verifications")
+            st.markdown("### 📜 Verification History")
             try:
-                recent_jobs = client.list_jobs(limit=10)
+                recent_jobs = client.list_jobs(limit=25)
                 if recent_jobs:
-                    for j in recent_jobs:
-                        v_label, _ = format_verdict_badge(j.final_verdict)
-                        btn_label = f"{j.target_filename} ({j.current_status}) — {j.job_id[:8]}"
-                        if st.button(btn_label, key=f"hist_{j.job_id}"):
+                    # Quick filter
+                    filter_options = ["All", "VERIFIED", "REJECTED", "FAILED"]
+                    selected_filter = st.selectbox("Filter History", options=filter_options, index=0)
+
+                    filtered_jobs = recent_jobs
+                    if selected_filter == "VERIFIED":
+                        filtered_jobs = [j for j in recent_jobs if j.final_verdict == Verdict.VERIFIED]
+                    elif selected_filter == "REJECTED":
+                        filtered_jobs = [
+                            j for j in recent_jobs
+                            if j.final_verdict and j.final_verdict.value.startswith("REJECTED")
+                        ]
+                    elif selected_filter == "FAILED":
+                        filtered_jobs = [j for j in recent_jobs if j.current_status == JobStatus.FAILED]
+
+                    st.caption(f"Showing {len(filtered_jobs)} of {len(recent_jobs)} jobs")
+
+                    for j in filtered_jobs:
+                        v_icon = "🟢" if j.final_verdict == Verdict.VERIFIED else (
+                            "🔴" if j.final_verdict and "REJECTED" in j.final_verdict.value else "⚪"
+                        )
+                        btn_label = f"{v_icon} {j.target_filename} ({j.job_id[:6]})"
+                        if st.button(btn_label, key=f"hist_{j.job_id}", use_container_width=True):
                             st.session_state.active_job_id = j.job_id
                             st.session_state.is_polling = False
                             st.session_state.poll_count = 0
                             st.rerun()
                 else:
-                    st.caption("No jobs submitted yet.")
+                    st.caption("No verification jobs submitted yet.")
             except (ApiConnectionError, ApiClientError):
                 st.caption("Unable to fetch job history (API offline).")
 
         # 3. Main Stage: Two Tabs
-        tab_submit, tab_evidence = st.tabs(["📝 1. Submit Module & Invariants", "🔍 2. Evidence & Verification Gate"])
+        tab_submit, tab_evidence = st.tabs([
+            "📝 1. Ingestion & Invariant Setup",
+            "🔍 2. Evidence, Gate & Verified Diff",
+        ])
 
         with tab_submit:
-            st.subheader("Submit Python Module for Isolated Verification")
+            st.markdown("### 🧪 Submit Python Module for Verification")
             st.caption(
-                "Provide the target code under test and your test harness with property-based invariants. "
-                "Tests execute strictly inside a resource-throttled Docker sandbox."
+                "Provide your implementation and property-based invariants. "
+                "Tests execute strictly inside a resource-throttled Docker sandbox (`--network none`, non-root)."
             )
 
             col_names_1, col_names_2 = st.columns(2)
@@ -122,21 +159,44 @@ def main():
                     help="Must be a valid Python filename ending in .py (e.g., test_target.py).",
                 )
 
-            source_input = st.text_area(
-                "Target Python Source Code",
-                value=st.session_state.source_code,
-                height=250,
-                help="The Python module containing potential edge-case bugs (max 128 KiB).",
-            )
-            invariants_input = st.text_area(
-                "Test Harness & Invariants Code (Hypothesis / Pytest)",
-                value=st.session_state.invariants_code,
-                height=250,
-                help="Test harness with unit tests and Hypothesis property invariants (max 128 KiB).",
-            )
+            col_code_1, col_code_2 = st.columns(2)
+            with col_code_1:
+                st.markdown("##### 📄 Target Source Code (Under Test)")
+                source_input = st.text_area(
+                    "Target Python Source Code",
+                    value=st.session_state.source_code,
+                    height=320,
+                    label_visibility="collapsed",
+                    placeholder="def my_function(x):\n    # implementation\n    ...",
+                    help="The Python module containing potential edge-case bugs (max 128 KiB).",
+                )
+                source_lines = len(source_input.strip().splitlines()) if source_input.strip() else 0
+                st.caption(f"Lines: {source_lines} | Characters: {len(source_input)}")
 
-            if st.button("🚀 Run RESQ Verification Gate", type="primary"):
-                # Basic client-side sanity check
+            with col_code_2:
+                st.markdown("##### 🛡️ Invariants & Test Harness (Hypothesis + Pytest)")
+                invariants_input = st.text_area(
+                    "Test Harness & Invariants Code (Hypothesis / Pytest)",
+                    value=st.session_state.invariants_code,
+                    height=320,
+                    label_visibility="collapsed",
+                    placeholder="from hypothesis import given, strategies as st\n\ndef test_property(...):\n    ...",
+                    help="Test harness with unit tests and Hypothesis property invariants (max 128 KiB).",
+                )
+                invariants_lines = len(invariants_input.strip().splitlines()) if invariants_input.strip() else 0
+                st.caption(f"Lines: {invariants_lines} | Characters: {len(invariants_input)}")
+
+            col_action_1, col_action_2 = st.columns([2, 1])
+            with col_action_1:
+                submit_clicked = st.button("🚀 Run RESQ Verification Gate", type="primary", use_container_width=True)
+            with col_action_2:
+                if st.button("🧹 Clear Editor Form", use_container_width=True):
+                    st.session_state.source_code = ""
+                    st.session_state.invariants_code = ""
+                    st.rerun()
+
+            if submit_clicked:
+                # Client-side validation
                 if not source_input.strip():
                     st.error("Source code cannot be empty.")
                 elif not invariants_input.strip():
@@ -167,20 +227,27 @@ def main():
 
         with tab_evidence:
             if not st.session_state.active_job_id:
-                st.info("No active verification job selected. Submit a job in Tab 1 or select a recent job from the sidebar.")
+                st.info("💡 No active verification job selected. Submit a job in Tab 1 or select a recent run from the sidebar.")
             else:
                 active_id = st.session_state.active_job_id
                 col_header_1, col_header_2 = st.columns([3, 1])
                 with col_header_1:
-                    st.markdown(f"### Job: `{active_id}`")
+                    st.markdown(f"### Verification Job: `{active_id}`")
                 with col_header_2:
-                    if st.button("🔄 Refresh Status"):
+                    if st.button("🔄 Refresh Status", use_container_width=True):
                         st.rerun()
 
                 try:
                     job_detail = client.get_job(active_id)
 
-                    # Status and Verdict cards
+                    # 1. Pipeline Stepper visualization
+                    render_pipeline_stepper(
+                        status=job_detail.current_status,
+                        runs_count=len(job_detail.runs),
+                        final_verdict=job_detail.final_verdict,
+                    )
+
+                    # 2. Status and Verdict cards
                     st_label, st_tone = format_status_badge(job_detail.current_status)
                     vd_label, vd_tone = format_verdict_badge(job_detail.final_verdict)
 
@@ -209,14 +276,30 @@ def main():
 
                     # Explicit empirical verification notice if VERIFIED
                     if job_detail.final_verdict == Verdict.VERIFIED:
-                        st.info(
-                            "💡 **Empirical Verification Notice:** `VERIFIED` confirms that the candidate patch "
-                            "resolved the concrete reproducer test and passed all regression test gates inside the Docker sandbox. "
-                            "This constitutes empirical test verification, not a formal mathematical proof of correctness."
+                        st.markdown(
+                            """
+                            <div class="resq-badge-verified">
+                                <strong>🎉 Empirical Verification Passed:</strong> The candidate patch resolved the concrete reproducer test 
+                                and passed all regression test gates inside the isolated Docker sandbox (exit code 0).
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+                    elif job_detail.final_verdict and "REJECTED" in job_detail.final_verdict.value:
+                        st.markdown(
+                            f"""
+                            <div class="resq-badge-rejected">
+                                <strong>🛡️ Patch Rejected by Verification Gate:</strong> {vd_label}
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
                         )
 
-                    # Render execution runs & evidence
-                    render_execution_runs(job_detail.runs)
+                    # 3. Render execution runs & evidence
+                    render_execution_runs(
+                        job_detail.runs,
+                        original_source=st.session_state.source_code,
+                    )
 
                     # 4. Bounded automatic polling
                     if st.session_state.is_polling:

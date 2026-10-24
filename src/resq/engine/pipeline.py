@@ -4,6 +4,7 @@ import shutil
 import tempfile
 from pathlib import Path
 from typing import Optional
+from resq.agent.agent import RESQVerificationAgent
 from resq.config import Settings, get_settings
 from resq.engine.failure_analyzer import FailureAnalyzer
 from resq.engine.patch_applier import PatchApplier
@@ -37,12 +38,21 @@ class VerificationPipeline:
         settings: Optional[Settings] = None,
         failure_analyzer: Optional[FailureAnalyzer] = None,
         patch_applier: Optional[PatchApplier] = None,
+        use_agent: bool = True,
     ):
         self.settings = settings or get_settings()
         self.execution_env = execution_env
         self.llm_provider = llm_provider or get_llm_provider(self.settings)
         self.failure_analyzer = failure_analyzer or FailureAnalyzer()
         self.patch_applier = patch_applier or PatchApplier()
+        self.use_agent = use_agent
+        self.agent = RESQVerificationAgent(
+            execution_env=self.execution_env,
+            llm_provider=self.llm_provider,
+            settings=self.settings,
+            failure_analyzer=self.failure_analyzer,
+            patch_applier=self.patch_applier,
+        )
 
     def run(
         self,
@@ -62,6 +72,14 @@ class VerificationPipeline:
         Returns:
             A completed VerificationJob entity with execution runs and final verdict.
         """
+        if self.use_agent:
+            return self.agent.run(
+                source_code=source_code,
+                test_code=test_code,
+                target_filename=target_filename,
+                test_filename=test_filename,
+            )
+
         job = VerificationJob(
             target_filename=target_filename,
             source_code=source_code,
