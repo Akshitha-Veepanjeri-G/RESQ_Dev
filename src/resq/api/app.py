@@ -91,3 +91,7 @@ def create_app(
         )
 
     return app
+
+
+# Default module-level application instance for ASGI servers (e.g., uvicorn resq.api.app:app)
+app = create_app()

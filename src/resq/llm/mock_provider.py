@@ -82,23 +82,64 @@ class MockLLMProvider(LLMProvider):
         mode: str = "valid",
         custom_patch: Optional[str] = None,
         custom_explanation: str = "Mock patch generated for testing.",
+        fixture_id: Optional[str] = None,
+        patch_map: Optional[dict[str, str]] = None,
     ):
         """Initializes MockLLMProvider.
 
         Args:
             mode: One of 'valid', 'still_fails', 'regression', 'syntax_error', or 'custom'.
-            custom_patch: Required if mode is 'custom'.
+            custom_patch: Optional explicit patch string to return.
             custom_explanation: Explanatory text for the patch.
+            fixture_id: Optional benchmark fixture ID (e.g. 'BM-01', 'BM-02') to auto-select its patch.
+            patch_map: Optional dictionary mapping fixture IDs to custom patches.
         """
         self.mode = mode
         self.custom_patch = custom_patch
         self.custom_explanation = custom_explanation
+        self.fixture_id = fixture_id
+        self.patch_map = patch_map or {}
         self.call_count = 0
 
     def generate_patch(self, source_code: str, failure: FailureArtifact) -> CandidatePatch:
-        """Returns deterministic candidate patch based on configured mode."""
+        """Returns deterministic candidate patch based on configured mode or fixture ID."""
         self.call_count += 1
 
+        # 1. Custom patch takes highest precedence
+        if self.custom_patch is not None:
+            return CandidatePatch(
+                patch_code=self.custom_patch,
+                explanation=self.custom_explanation,
+                raw_model_response=self.custom_patch,
+                provider_name="mock",
+            )
+
+        # 2. Patch map lookup for specified fixture_id
+        if self.fixture_id and self.fixture_id in self.patch_map:
+            patch_code = self.patch_map[self.fixture_id]
+            return CandidatePatch(
+                patch_code=patch_code,
+                explanation=f"Deterministic mock patch mapped for {self.fixture_id}.",
+                raw_model_response=patch_code,
+                provider_name="mock",
+            )
+
+        # 3. Dynamic lookup from benchmark fixture dataset if fixture_id is provided
+        if self.fixture_id:
+            try:
+                from benchmarks.loader import get_fixture_by_id
+                fixture = get_fixture_by_id(self.fixture_id)
+                if fixture and fixture.candidate_patch:
+                    return CandidatePatch(
+                        patch_code=fixture.candidate_patch,
+                        explanation=f"Deterministic mock patch for {self.fixture_id}.",
+                        raw_model_response=fixture.candidate_patch,
+                        provider_name="mock",
+                    )
+            except Exception:
+                pass
+
+        # 4. Standard predefined modes
         if self.mode == "valid":
             patch_code = VALID_BINARY_SEARCH_PATCH
             explanation = "Replaced `low < high` with `low <= high` to resolve boundary element search."
@@ -112,10 +153,7 @@ class MockLLMProvider(LLMProvider):
             patch_code = SYNTAX_ERROR_PATCH
             explanation = "Malformed Python patch that triggers SyntaxError."
         elif self.mode == "custom":
-            if self.custom_patch is None:
-                raise ValueError("custom_patch must be provided when mode is 'custom'")
-            patch_code = self.custom_patch
-            explanation = self.custom_explanation
+            raise ValueError("custom_patch must be provided when mode is 'custom'")
         else:
             raise ValueError(f"Unknown mock provider mode: {self.mode}")
 

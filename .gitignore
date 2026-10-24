@@ -38,6 +38,7 @@ env/
 .coverage
 htmlcov/
 .tox/
+pytest_results*.xml
 
 # Local databases and WAL files
 *.db
